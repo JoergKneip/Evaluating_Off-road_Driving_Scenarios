@@ -1,0 +1,180 @@
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from scipy.stats import norm
+import os
+import sys
+import tkinter as tk
+from tkinter import filedialog
+
+# =============================================================================
+# KONFIGURATION
+# =============================================================================
+STANDARD_FILENAME = "drohnen_messdaten.xlsx" 
+HTML_REPORT = "statistik_report_full_legend.html"
+
+HOVER_VELOCITY_THRESHOLD = 0.05 
+TOLERANCE_CM = 1.0 
+
+# =============================================================================
+# HILFSFUNKTIONEN
+# =============================================================================
+def select_file_gui():
+    root = tk.Tk()
+    root.withdraw() 
+    print("Bitte wähle die Excel-Datei im Popup-Fenster aus...")
+    file_path = filedialog.askopenfilename(
+        title="Wähle deine Drohnen-Messdaten",
+        filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")]
+    )
+    root.destroy()
+    return file_path
+
+# =============================================================================
+# ANALYSE LOGIK
+# =============================================================================
+def analyze_precision():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    file_path = os.path.join(script_dir, STANDARD_FILENAME)
+
+    if not os.path.exists(file_path):
+        file_path = select_file_gui()
+        if not file_path: return
+
+    try:
+        df = pd.read_excel(file_path)
+    except Exception as e:
+        print(f"Fehler: {e}")
+        return
+    
+    if "Frame" not in df.columns: df["Frame"] = df.index
+    required_cols = ["AVG_Vehicle_X", "AVG_Vehicle_Y", "AVG_Vehicle_Z"]
+    
+    if not all(col in df.columns for col in required_cols):
+        print("Fehler: Spalten fehlen.")
+        return
+
+    coords = df[required_cols].to_numpy()
+    diffs = np.diff(coords, axis=0)
+    dists = np.linalg.norm(diffs, axis=1)
+    dists = np.insert(dists, 0, 100.0) 
+    
+    df['movement'] = dists
+    df['is_hovering'] = df['movement'] < HOVER_VELOCITY_THRESHOLD
+    df['group'] = (df['is_hovering'] != df['is_hovering'].shift()).cumsum()
+    hover_groups = df[df['is_hovering']]
+    
+    if hover_groups.empty:
+        print("Keine stabile Phase gefunden.")
+        return
+
+    best_group_id = hover_groups['group'].value_counts().idxmax()
+    best_phase = df[df['group'] == best_group_id].copy()
+    
+    print(f"Analysiere Phase: {len(best_phase)} Frames")
+
+    # 3. Statistik & Visualisierung
+    axes_names = ['X-Achse', 'Y-Achse', 'Z-Achse']
+    cols = ["AVG_Vehicle_X", "AVG_Vehicle_Y", "AVG_Vehicle_Z"]
+    colors = ['#636EFA', '#EF553B', '#00CC96'] 
+    
+    # --- KORREKTUR HIER: Feste Titel statt Variable 'a' ---
+    fig = make_subplots(
+        rows=3, cols=1,
+        subplot_titles=["X-Achse (Längs)", "Y-Achse (Quer)", "Z-Achse (Höhe)"],
+        vertical_spacing=0.15
+    )
+    
+    tolerance_m = TOLERANCE_CM / 100.0
+
+    for i, axis_name in enumerate(axes_names):
+        data = best_phase[cols[i]].values
+        frames = best_phase["Frame"].values
+        mu, std = norm.fit(data)
+        
+        row_idx = i + 1
+
+        # A) Histogramm
+        fig.add_trace(go.Histogram(
+            x=data,
+            name=f'{axis_name}: Verteilung', 
+            opacity=0.3,
+            histnorm='probability density',
+            marker_color=colors[i],
+            showlegend=True
+        ), row=row_idx, col=1)
+
+        # B) Gauß-Kurve
+        # --- ZOOM EINSTELLUNG ---
+        # Um den Zoom manuell zu setzen, ändere 'std * 8' in eine feste Zahl
+        zoom_width = max(tolerance_m * 0.4, std * 0.05) 
+        
+        x_range = np.linspace(mu - zoom_width, mu + zoom_width, 400)
+        p = norm.pdf(x_range, mu, std)
+        
+        fig.add_trace(go.Scatter(
+            x=x_range, 
+            y=p, 
+            mode='lines', 
+            name=f'{axis_name}: Gauß-Kurve',
+            line=dict(width=2, color='#333333'), 
+            showlegend=True 
+        ), row=row_idx, col=1)
+
+        # C) Einzelpunkte
+        fig.add_trace(go.Scatter(
+            x=data,
+            y=np.zeros_like(data), 
+            mode='markers',
+            name=f'{axis_name}: Punkte',
+            text=[f"Frame: {f}<br>Wert: {v:.4f}m" for f, v in zip(frames, data)],
+            hovertemplate='%{text}<extra></extra>',
+            marker=dict(
+    symbol='circle', 
+    size=6, 
+    color=colors[i], 
+    line=dict(
+        width=1, 
+        color='black'
+    ), 
+    opacity=0.8
+),
+            showlegend=True 
+        ), row=row_idx, col=1)
+
+        # Grenzwert-Linien
+        # Zeichne beide Toleranzlinien (links/rechts bzw. oben/unten) in einer Schleife
+        for boundary in [mu - tolerance_m, mu + tolerance_m]:
+            fig.add_vline(
+                x=boundary,
+                line_width=2,
+                line_dash="dash",
+                line_color="red",
+                row=row_idx,
+                col=1
+        )
+        
+        # Achsen-Zoom anwenden
+        fig.update_xaxes(
+            range=[mu - zoom_width, mu + zoom_width], 
+            title_text=f"Meter (Mittelwert: {mu:.3f})", 
+            row=row_idx, col=1
+        )
+        fig.update_yaxes(showticklabels=False, row=row_idx, col=1)
+
+    fig.update_layout(
+        height=1000,
+        title_text=f"<b>Messanalyse Vollständig</b>",
+        template="plotly_white",
+        hovermode="closest",
+        legend=dict(groupclick="toggleitem") 
+    )
+    
+    fig.write_html(HTML_REPORT)
+    print(f"Fertig! Bericht gespeichert: {HTML_REPORT}")
+    try: os.startfile(HTML_REPORT)
+    except: pass
+
+if __name__ == "__main__":
+    analyze_precision()
